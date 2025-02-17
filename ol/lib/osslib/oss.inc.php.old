@@ -1,0 +1,2214 @@
+<?php 
+   if (!defined('_OSS_LAYER')) {
+      define('_OSS_LAYER',1);
+   if (!defined('OSS_DIR')) define('OSS_DIR',dirname(__FILE__));
+//echo '<P> In Oss base lib ' . $root_path . ' ' . $_SESSION['webdbUsername'] . '</P>' ;
+   
+//echo '<P> OssNewConnection  testing exit ' . $db . '</P>' ;
+   GLOBAL 
+      $OSS_vers,       // database version
+      $OSS_COUNTRECS,   // count number of records returned - slows down query
+      $OSS_CACHE_DIR,   // directory to cache recordsets
+      $OSS_EXTENSION,   // OSS extension installed
+      $OSS_COMPAT_FETCH, // If $OSS_COUNTRECS and this is true, $rs->fields is available on EOF
+      $OSS_FETCH_MODE;   // DEFAULT, NUM, ASSOC or BOTH. Default follows native driver default...
+   
+   $OSS_EXTENSION = defined('OSS_EXTENSION');
+   
+   define('OSS_FORCE_IGNORE',0);
+   define('OSS_FORCE_NULL',1);
+   define('OSS_FORCE_EMPTY',2);
+   define('OSS_FORCE_VALUE',3);
+
+   if (!$OSS_EXTENSION || OSS_EXTENSION < 4.0) {
+      define('OSS_BAD_RS','<p>Bad $rs in %s. Conn/SQL invalid. Try $connection->debug=true;</p>');
+      define('OSS_TABLE_REGEX','([]0-9a-z_\"\`\.\@\[-]*)');
+      if (!defined('OSS_PREFETCH_ROWS')) define('OSS_PREFETCH_ROWS',10);
+   
+      define('OSS_FETCH_DEFAULT',0);
+      define('OSS_FETCH_NUM',1);
+      define('OSS_FETCH_ASSOC',2);
+      define('OSS_FETCH_BOTH',3);
+      if (!defined('TIMESTAMP_FIRST_YEAR')) define('TIMESTAMP_FIRST_YEAR',100);
+   
+      $_oss_ver = (float) PHP_VERSION;
+      if ($_oss_ver >= 5.0) {
+         define('OSS_PHPVER',0x5000);
+      } else if ($_oss_ver > 4.299999) { # 4.3
+         define('OSS_PHPVER',0x4300);
+      } else if ($_oss_ver > 4.199999) { # 4.2
+         define('OSS_PHPVER',0x4200);
+      } else if (strnatcmp(PHP_VERSION,'4.0.5')>=0) {
+         define('OSS_PHPVER',0x4050);
+      } else {
+         define('OSS_PHPVER',0x4000);
+      }
+   }
+   
+   function OSS_str_replace($src, $dest, $data) {
+      if (OSS_PHPVER >= 0x4050) return str_replace($src,$dest,$data);
+      $s = reset($src);
+      $d = reset($dest);
+      while ($s !== false) {
+         $data = str_replace($s,$d,$data);
+         $s = next($src);
+         $d = next($dest);
+      }
+      return $data;
+   }
+   
+   function OSS_Setup() {
+   GLOBAL 
+      $OSS_vers,       // database version
+      $OSS_COUNTRECS,   // count number of records returned - slows down query
+      $OSS_CACHE_DIR,   // directory to cache recordsets
+      $OSS_FETCH_MODE,
+      $OSS_FORCE_TYPE;
+      
+      $OSS_FETCH_MODE = OSS_FETCH_DEFAULT;
+      $OSS_FORCE_TYPE = OSS_FORCE_VALUE;
+
+      if (!isset($OSS_CACHE_DIR)) {
+         $OSS_CACHE_DIR = '/tmp'; //(isset($_ENV['TMP'])) ? $_ENV['TMP'] : '/tmp';
+      } else {
+         if (strpos($OSS_CACHE_DIR,'://') !== false) die("Illegal path http:// or ftp://");
+      }
+      srand(((double)microtime())*1000000);
+      $OSS_vers = 'V1.0';
+      if (!isset($OSS_COUNTRECS)) $OSS_COUNTRECS = true; 
+   }
+   
+   OSS_Setup();
+
+   class OssFieldObject { 
+      var $name = '';
+      var $max_length=0;
+      var $type="";
+      var $not_null = false; 
+      var $has_default = false;  
+      var $default_value; // Check has_default first.
+   }
+   
+   function OSS_TransMonitor($dbms, $fn, $errno, $errmsg, $p1, $p2, &$thisConnection) {
+      $thisConnection->_transOK = false;
+      if ($thisConnection->_oldRaiseFn) {
+         $fn = $thisConnection->_oldRaiseFn;
+         $fn($dbms, $fn, $errno, $errmsg, $p1, $p2,$thisConnection);
+      }
+   }
+   
+   class OssConnection {
+      var $dataProvider = 'native';
+      var $databaseType = '';      /// RDBMS currently in use mysql or postgre               
+      var $database = '';         /// Name of database to be used.   
+      var $host = '';          /// The hostname of the database server   
+      var $user = '';          /// The username which is used to connect to the database server. 
+      var $password = '';       /// Password for the username. For security, we no longer store it.
+      var $debug = false;       /// if set to true will output sql statements
+      var $maxblobsize = 262144;    /// maximum size of blobs or large text fields (256K)
+      var $concat_operator = '+'; /// default concat operator -- change to || for Oracle/Interbase   
+      var $substr = 'substr';      /// substring operator
+      var $length = 'length';      /// string length operator
+      var $random = 'rand()';      /// random function
+      var $upperCase = 'upper';      /// uppercase function
+      var $fmtDate = "'Y-m-d'";   /// used by DBDate() as the default date format used by the database
+      var $fmtTimeStamp = "'Y-m-d, h:i:s A'"; /// used by DBTimeStamp as the default timestamp fmt.
+      var $true = '1';          /// string that represents TRUE for a database
+      var $false = '0';          /// string that represents FALSE for a database
+      var $replaceQuote = "\\'";    /// string to use to replace quotes
+      var $nameQuote = '"';      /// string to use to quote identifiers and names
+      var $charSet=false;       /// character set to use - only for postgres
+      var $metaDatabasesSQL = '';
+      var $metaTablesSQL = '';
+      var $uniqueOrderBy = false; /// All order by columns have to be unique
+      var $emptyDate = '&nbsp;';
+      var $emptyTimeStamp = '&nbsp;';
+      var $lastInsID = false;
+      //--
+      var $hasInsertID = false;       /// supports autoincrement ID?
+      var $hasAffectedRows = false;    /// supports affected rows for update/delete?
+      var $hasTop = false;         /// support  SELECT TOP 10 * FROM TABLE
+      var $hasLimit = false;         /// support pgsql/mysql SELECT * FROM TABLE LIMIT 10
+      var $readOnly = false;          /// this is a readonly database - used by phpLens
+      var $hasMoveFirst = false;  /// has ability to run MoveFirst(), scrolling backwards
+      var $hasGenID = false;       /// can generate sequences using GenID();
+      var $hasTransactions = true; /// has transactions
+      //--
+      var $genID = 0;          /// sequence id used by GenID();
+      var $raiseErrorFn = false;    /// error function to call
+      var $isoDates = false; /// accepts dates in ISO format
+      var $cacheSecs = 3600; /// cache for 1 hour
+      var $sysDate = false; /// name of function that returns the current date
+      var $sysTimeStamp = false; /// name of function that returns the current timestamp
+      var $arrayClass = 'OssRecordSet_array'; /// class to gen. array rs, which are pre-downloaded rs
+      var $numCacheHits = 0; 
+      var $numCacheMisses = 0;
+      var $pageExecuteCountRows = true;
+      var $uniqueSort = false; /// indicates that all fields in order by must be unique
+      var $leftOuter = false; /// operator to use for left outer join in WHERE clause
+      var $rightOuter = false; /// operator to use for right outer join in WHERE clause
+      var $ansiOuter = false; /// whether ansi outer join syntax supported
+      var $autoRollback = false; // autoRollback on PConnect().
+      var $poorAffectedRows = false; // affectedRows not working or unreliable
+      var $fnExecute = false;
+      var $fnCacheExecute = false;
+      var $blobEncodeType = false; // false=not required, 'I'=encode to integer, 'C'=encode to char
+      var $rsPrefix = "OssRecordSet_";
+      var $autoCommit = true;    /// do not modify this yourself - actually private
+      var $transOff = 0;          /// temporarily disable transactions
+      var $transCnt = 0;          /// count of nested transactions
+      var $fetchMode=false;
+   
+       // PRIVATE VARS
+      var $_oldRaiseFn =  false;
+      var $_transOK = null;
+      var $_connectionID   = false;   /// The returned link identifier for successful db connection    
+      var $_errorMsg = false;      /// returned last error message. returned by the errorMsg() 
+      var $_queryID = false;      /// This variable keeps the last created result link identifier
+      var $_isPersistentConnection = false;   /// To state whether its a persistent connection 
+      var $_bindInputArray = false; ///if OssConnection.Execute() permits binding of array parameters.
+      var $_evalAll = false;
+      var $_affected = false;
+      var $_logsql = false;
+   
+      public function __construct() {
+         $this->OssConnection() ;
+      }
+      function OssConnection() {
+         die('Virtual Class -- cannot instantiate');
+      }
+      
+      function Version() {
+         global $OSS_vers;
+         return (float) substr($OSS_vers,1);
+      }
+      
+      function ServerInfo() {
+         return array('description' => '', 'version' => '');
+      }
+      
+      function IsConnected() {
+          return !empty($this->_connectionID);
+      }
+      
+      function _findvers($str) {
+         if (preg_match('/([0-9]+\.([0-9\.])+)/',$str, $arr)) return $arr[1];
+         else return '';
+      }
+      
+      function outp($msg,$newline=true) {
+         global $HTTP_SERVER_VARS,$OSS_FLUSH,$OSS_OUTP;
+         if (defined('OSS_OUTP')) {
+            $fn = OSS_OUTP;
+           $fn($msg,$newline);
+            return;
+         } else if (isset($OSS_OUTP)) {
+            $fn = $OSS_OUTP;
+            $fn($msg,$newline);
+            return;
+         }
+         if ($newline) $msg .= "<br>\n";
+         if (isset($HTTP_SERVER_VARS['HTTP_USER_AGENT']) || !$newline) echo $msg;
+         else echo strip_tags($msg);
+         if (!empty($OSS_FLUSH) && ob_get_length() !== false) flush();  
+      }
+      
+      function Time() {
+         $rs =& $this->_Execute("select $this->sysTimeStamp");
+         if ($rs && !$rs->EOF) return $this->UnixTimeStamp(reset($rs->fields));
+         
+         return false;
+      }
+      
+      function Connect($argHost = "", $argUser = "", $argPass = "", $argDb = "", $forceNew = false){
+         if ($argHost != "") $this->host = $argHost;
+         if ($argUser != "") $this->user = $argUser;
+         if ($argPass != "") $this->password = $argPass; // not stored for security reasons
+         if ($argDb != "") $this->database = $argDb;      
+         
+         $this->_isPersistentConnection = false;   
+         if ($forceNew) {
+            if ($this->_nconnect($this->host, $this->user, $this->password, $this->database))
+               return true;
+         } else {
+            if ($this->_connect($this->host, $this->user, $this->password, $this->database))
+               return true;
+         }
+         $err = $this->ErrorMsg();
+         if (empty($err)) $err = "Connection fails to server '$argHost' for user '$argUser'";
+//echo "</P> " . __FILE__ . "-" . $this->raiseErrorFn . " Error -$err-</p>" ;
+//         if ($fn = $this->raiseErrorFn) 
+//            $fn($this->databaseType,'CONNECT',$this->ErrorNo(),$err,$this->host,$this->database,$this);
+         $this->_connectionID = false;
+//echo "</P> " . __FILE__ . " Error -$err-</p>" ;
+         if ($this->debug) OssConnection::outp( $this->host.': '.$err);
+//echo "</P> " . __FILE__ . " Error -$err-</p>" ;
+         return false;
+      }   
+      
+      function _nconnect($argHost, $argUser, $argPass, $argDb) {
+         return $this->_connect($argHost, $argUser, $argPass, $argDb);
+      }
+      
+      function NConnect($argHost = "", $argUser = "", $argPass = "", $argDb = "") {
+         return $this->Connect($argHost, $argUser, $argPass, $argDb, true);
+      }
+      
+      function PConnect($argHost = "", $argUser = "", $argPass = "", $argDb = "") {
+         if (defined('OSS_NEVER_PERSIST')) return $this->Connect($argHost,$argUser,$argPass,$argDb);
+         
+         if ($argHost != "") $this->host = $argHost;
+         if ($argUser != "") $this->user = $argUser;
+         if ($argPass != "") $this->password = $argPass;
+         if ($argDb != "") $this->database = $argDb;      
+            
+         $this->_isPersistentConnection = true;   
+         if ($this->_pconnect($this->host, $this->user, $this->password, $this->database)) return true;
+         $err = $this->ErrorMsg();
+         if (empty($err)) {
+            $err = "Connection error to server '$argHost' with user '$argUser'";
+         }   
+         if ($fn = $this->raiseErrorFn) {
+            $fn($this->databaseType,'PCONNECT',$this->ErrorNo(),$err,$this->host,$this->database,$this);
+         }
+         
+         $this->_connectionID = false;
+         if ($this->debug) OssConnection::outp( $this->host.': '.$err);
+         return false;
+      }
+   
+      function SQLDate($fmt, $col=false) {   
+         if (!$col) $col = $this->sysDate;
+         return $col; 
+      }
+      
+      function Prepare($sql) {
+         return $sql;
+      }
+   
+      function PrepareSP($sql,$param=true) {
+         return $this->Prepare($sql,$param);
+      }
+      
+      function Quote($s) {
+         return $this->qstr($s,false);
+      }
+      
+      function QMagic($s) {
+         return $this->qstr($s,get_magic_quotes_gpc());
+      }
+   
+      function q(&$s) {
+         $s = $this->qstr($s,false);
+      }
+      
+      function ErrorNative() {
+         return $this->ErrorNo();
+      }
+      
+      function nextId($seq_name) {
+         return $this->GenID($seq_name);
+      }
+   
+      function RowLock($table,$where) {
+         return false;
+      }
+      
+      function CommitLock($table) {
+         return $this->CommitTrans();
+      }
+      
+      function RollbackLock($table) {
+         return $this->RollbackTrans();
+      }
+      
+      function SetFetchMode($mode) {   
+         $old = $this->fetchMode;
+         $this->fetchMode = $mode;
+         
+         if ($old === false) {
+         global $OSS_FETCH_MODE;
+            return $OSS_FETCH_MODE;
+         }
+         return $old;
+      }
+   
+      function &Query($sql, $inary=false) {
+         $rs = &$this->Execute($sql, $inary);
+         if (!$rs && defined('OSS_PEAR')) return OSS_PEAR_Error();
+         return $rs;
+      }
+   
+      function &LimitQuery($sql, $offset, $count, $params=false) {
+         $rs = &$this->SelectLimit($sql, $count, $offset, $params); 
+         if (!$rs && defined('OSS_PEAR')) return OSS_PEAR_Error();
+         return $rs;
+      }
+   
+      function Disconnect() {
+         return $this->Close();
+      }
+      
+      function Param($name,$type='C') {
+         return '?';
+      }
+      
+      function InParameter(&$stmt,&$var,$name,$maxLen=4000,$type=false) {
+         return $this->Parameter($stmt,$var,$name,false,$maxLen,$type);
+      }
+      
+      function OutParameter(&$stmt,&$var,$name,$maxLen=4000,$type=false) {
+         return $this->Parameter($stmt,$var,$name,true,$maxLen,$type);
+      }
+      
+      function Parameter(&$stmt,&$var,$name,$isOutput=false,$maxLen=4000,$type=false) {
+         return false;
+      }
+      
+      function StartTrans($errfn = 'OSS_TransMonitor') {
+         if ($this->transOff > 0) {
+            $this->transOff += 1;
+            return;
+         }
+         $this->_oldRaiseFn = $this->raiseErrorFn;
+         $this->raiseErrorFn = $errfn;
+         $this->_transOK = true;
+         if ($this->debug && $this->transCnt > 0) 
+            OssConnection::outp("Bad Transaction: StartTrans called within BeginTrans");
+         $this->BeginTrans();
+         $this->transOff = 1;
+      }
+      
+      function CompleteTrans($autoComplete = true) {
+         if ($this->transOff > 1) {
+            $this->transOff -= 1;
+            return true;
+         }
+         $this->raiseErrorFn = $this->_oldRaiseFn;
+         $this->transOff = 0;
+         if ($this->_transOK && $autoComplete) {
+            if (!$this->CommitTrans()) {
+               $this->_transOK = false;
+               if ($this->debug) OssConnection::outp("Smart Commit failed");
+            } else if ($this->debug) OssConnection::outp("Smart Commit occurred");
+         } else {
+            $this->RollbackTrans();
+            if ($this->debug) OssCOnnection::outp("Smart Rollback occurred");
+         }
+         return $this->_transOK;
+      }
+      
+      function FailTrans() {
+         if ($this->debug) 
+            if ($this->transOff == 0) {
+               OssConnection::outp("FailTrans outside StartTrans/CompleteTrans");
+            } else {
+               OssConnection::outp("FailTrans was called");
+               oss_backtrace();
+            }
+         $this->_transOK = false;
+      }
+      
+      function HasFailedTrans() {
+         if ($this->transOff > 0) return $this->_transOK == false;
+         return false;
+      }
+      
+      function &Execute($sql,$inary=false) {
+         if ($this->fnExecute) {
+            $fn = $this->fnExecute;
+            $ret =& $fn($this,$sql,$inary);
+            if (isset($ret)) return $ret;
+         }
+         if ($inary) {
+            if (!is_array($inary)) $inary = array($inary);
+            $element0 = reset($inary);
+            $array_2d = is_array($element0) && !is_object(reset($element0));
+            if (!is_array($sql) && !$this->_bindInputArray) {
+               $sqlarr = explode('?',$sql);
+               if (!$array_2d) $inary = array($inary);
+               foreach($inary as $arr) {
+                  $sql = ''; $i = 0;
+                  foreach($arr as $v) {
+                     $sql .= $sqlarr[$i];
+                     if (gettype($v) == 'string')
+                        $sql .= $this->qstr($v);
+                     else if ($v === null)
+                        $sql .= 'NULL';
+                     else
+                        $sql .= $v;
+                     $i += 1;
+                  }
+                  $sql .= $sqlarr[$i];
+                  if ($i+1 != sizeof($sqlarr))   
+                     OssConnection::outp( "Input Array does not match ?: ".htmlspecialchars($sql));
+   
+                  $ret =& $this->_Execute($sql);
+//echo '<p>In OssConnection class ' . $ret . '</p>' ;
+                  if (!$ret) return $ret;
+               }   
+            } else {
+               if ($array_2d) {
+                  $stmt = $this->Prepare($sql);
+                  foreach($inary as $arr) {
+                     $ret =& $this->_Execute($stmt,$arr);
+                     if (!$ret) return $ret;
+                  }
+               } else {
+                  $ret =& $this->_Execute($sql,$inary);
+               }
+            }
+         } else {
+            $ret =& $this->_Execute($sql,false);
+         }
+         return $ret;
+      }
+      
+      function &_Execute($sql,$inary=false) {
+         if ($this->debug) {
+            global $OSS_INCLUDED_LIB;
+            if (empty($OSS_INCLUDED_LIB)) include_once(OSS_DIR.'/oss_lib.inc.php');
+            $this->_queryID = _oss_debug_execute($this, $sql,$inary);
+         } else {
+            $this->_queryID = @$this->_query($sql,$inary);
+         }
+         if ($this->_queryID === false) { // error handling if query fails
+            if ($this->debug == 99) oss_backtrace(true,5);   
+            $fn = $this->raiseErrorFn;
+            if ($fn) {
+               $fn($this->databaseType,'EXECUTE',$this->ErrorNo(),$this->ErrorMsg(),$sql,$inary,$this);
+            } 
+            $false = false;
+            return $false;
+         } 
+         
+         if ($this->_queryID === true) { // return simplified recordset for inserts/updates/deletes with lower overhead
+//echo '<p>In OssConnection Returns empty recordset '  . '</p>' ;
+            $rs = new OssRecordSet_empty();
+            return $rs;
+         }
+         
+         // return real recordset from select statement
+         $rsclass = $this->rsPrefix.$this->databaseType;
+         $rs = new $rsclass($this->_queryID,$this->fetchMode);
+         $rs->connection = &$this; // Pablo suggestion
+         $rs->Init();
+         if (is_array($sql)) $rs->sql = $sql[0];
+         else $rs->sql = $sql;
+         if ($rs->_numOfRows <= 0) {
+         global $OSS_COUNTRECS;
+            if ($OSS_COUNTRECS) {
+               if (!$rs->EOF) { 
+//echo '<p>In OssConnection recordset No Eof ' . $OSS_COUNTRECS  . '</p>' ;
+                  $rs = &$this->_rs2rs($rs,-1,-1,!is_array($sql));
+                  $rs->_queryID = $this->_queryID;
+               } else $rs->_numOfRows = 0;
+            }
+         }
+         return $rs;
+      }
+   
+      function CreateSequence($seqname='ossseq',$startID=1) {
+         if (empty($this->_genSeqSQL)) return false;
+         return $this->Execute(sprintf($this->_genSeqSQL,$seqname,$startID));
+      }
+   
+      function DropSequence($seqname) {
+         if (empty($this->_dropSeqSQL)) return false;
+         return $this->Execute(sprintf($this->_dropSeqSQL,$seqname));
+      }
+   
+      function GenID($seqname='ossseq',$startID=1) {
+         if (!$this->hasGenID) {
+            return 0; // formerly returns false pre 1.60
+         }
+         
+         $getnext = sprintf($this->_genIDSQL,$seqname);
+         
+         $holdtransOK = $this->_transOK;
+         @($rs = $this->Execute($getnext));
+         if (!$rs) {
+            $this->_transOK = $holdtransOK; //if the status was ok before reset
+            $createseq = $this->Execute(sprintf($this->_genSeqSQL,$seqname,$startID));
+            $rs = $this->Execute($getnext);
+         }
+         if ($rs && !$rs->EOF) $this->genID = reset($rs->fields);
+         else $this->genID = 0; // false
+      
+         if ($rs) $rs->Close();
+   
+         return $this->genID;
+      }   
+   
+      function Insert_ID($table='',$column='') {
+         if ($this->_logsql && $this->lastInsID) return $this->lastInsID;
+         if ($this->hasInsertID) return $this->_insertid($table,$column);
+         if ($this->debug) {
+            OssConnection::outp( '<p>Insert_ID error</p>');
+            oss_backtrace();
+         }
+         return false;
+      }
+   
+   
+      function PO_Insert_ID($table="", $id="") {
+         if ($this->hasInsertID){
+            return $this->Insert_ID($table,$id);
+         } else {
+            return $this->GetOne("SELECT MAX($id) FROM $table");
+         }
+      }
+   
+      function Affected_Rows() {
+         if ($this->hasAffectedRows) {
+            if ($this->fnExecute === 'oss_log_sql') {
+               if ($this->_logsql && $this->_affected !== false) return $this->_affected;
+            }
+            $val = $this->_affectedrows();
+            return ($val < 0) ? false : $val;
+         }
+                 
+         if ($this->debug) OssConnection::outp( '<p>Affected_Rows error</p>',false);
+         return false;
+      }
+      
+      function ErrorMsg() {
+         return '!! '.strtoupper($this->dataProvider.' '.$this->databaseType).': '.$this->_errorMsg;
+      }
+      
+      
+      function ErrorNo() {
+         return ($this->_errorMsg) ? -1 : 0;
+      }
+      
+      function MetaError($err=false) {
+         include_once(OSS_DIR."/oss_error.inc.php");
+         if ($err === false) $err = $this->ErrorNo();
+         return oss_error($this->dataProvider,$this->databaseType,$err);
+      }
+      
+      function MetaErrorMsg($errno) {
+         include_once(OSS_DIR."/oss_error.inc.php");
+         return oss_errormsg($errno);
+      }
+      
+      function MetaPrimaryKeys($table, $owner=false) {
+         $p = array();
+         $objs =& $this->MetaColumns($table);
+         if ($objs) {
+            foreach($objs as $v) {
+               if (!empty($v->primary_key))
+                  $p[] = $v->name;
+            }
+         }
+         if (sizeof($p)) return $p;
+         if (function_exists('OSS_VIEW_PRIMARYKEYS'))
+            return OSS_VIEW_PRIMARYKEYS($this->databaseType, $this->database, $table, $owner);
+         return false;
+      }
+      
+      function MetaForeignKeys($table, $owner=false, $upper=false) {
+         return false;
+      }
+      function SelectDB($dbName) {return false;}
+      
+      function &SelectLimit($sql,$nrows=-1,$offset=-1, $inary=false,$secs2cache=0) {
+         if ($this->hasTop && $nrows > 0) {
+            if ($offset <= 0) {
+               $sql = preg_replace( '/(^\s*select\s)/i','\\1 '.$this->hasTop.' '.$nrows.' ',$sql);
+            } else {
+               $nn = $nrows + $offset;
+               $sql = preg_replace( '/(^\s*select\s)/i','\\1 '.$this->hasTop.' '.$nn.' ',$sql);
+            }
+         }
+         
+         global $OSS_COUNTRECS;
+         
+         $savec = $OSS_COUNTRECS;
+         $OSS_COUNTRECS = false;
+            
+         if ($offset>0){
+            if ($secs2cache>0) $rs = &$this->CacheExecute($secs2cache,$sql,$inary);
+            else $rs = &$this->Execute($sql,$inary);
+         } else {
+            if ($secs2cache>0) $rs = &$this->CacheExecute($secs2cache,$sql,$inary);
+            else $rs = &$this->Execute($sql,$inary);
+         }
+         $OSS_COUNTRECS = $savec;
+         if ($rs && !$rs->EOF) {
+            $rs =& $this->_rs2rs($rs,$nrows,$offset);
+         }
+         return $rs;
+      }
+      
+      function &SerializableRS(&$rs) {
+         $rs2 =& $this->_rs2rs($rs);
+         $ignore = false;
+         $rs2->connection =& $ignore;
+         
+         return $rs2;
+      }
+      
+      function &_rs2rs(&$rs,$nrows=-1,$offset=-1,$close=true) {
+         if (! $rs) {
+            $false = false;
+            return $false;
+         }
+         $dbtype = $rs->databaseType;
+         if (!$dbtype) {
+            $rs = &$rs;  // required to prevent crashing in 4.2.1, but does not happen in 4.3.1 -- why ?
+            return $rs;
+         }
+         if (($dbtype == 'array' || $dbtype == 'csv') && $nrows == -1 && $offset == -1) {
+            $rs->MoveFirst();
+            $rs = &$rs; // required to prevent crashing in 4.2.1, but does not happen in 4.3.1-- why ?
+            return $rs;
+         }
+         $flds = array();
+         for ($i=0, $max=$rs->FieldCount(); $i < $max; $i++) {
+            $flds[] = $rs->FetchField($i);
+         }
+   
+         $arr =& $rs->GetArrayLimit($nrows,$offset);
+   
+         if ($close) $rs->Close();
+         $arrayClass = $this->arrayClass;
+         
+         $rs2 = new $arrayClass();
+         $rs2->connection = &$this;
+         $rs2->sql = $rs->sql;
+         $rs2->dataProvider = $this->dataProvider;
+         $rs2->InitArrayFields($arr,$flds);
+         $rs2->fetchMode = isset($rs->ossFetchMode) ? $rs->ossFetchMode : $rs->fetchMode;
+         return $rs2;
+      }
+      
+      function GetAll($sql, $inary=false) {
+         $arr =& $this->GetArray($sql,$inary);
+         return $arr;
+      }
+      
+      function &GetAssoc($sql, $inary=false,$force_array = false, $first2cols = false) {
+         $rs =& $this->Execute($sql, $inary);
+         if (!$rs) {
+            $false = false;
+            return $false;
+         }
+         $arr =& $rs->GetAssoc($force_array,$first2cols);
+         return $arr;
+      }
+      
+      function &CacheGetAssoc($secs2cache, $sql=false, $inary=false,$force_array = false, $first2cols = false) {
+         if (!is_numeric($secs2cache)) {
+            $first2cols = $force_array;
+            $force_array = $inary;
+         }
+         $rs =& $this->CacheExecute($secs2cache, $sql, $inary);
+         if (!$rs) {
+            $false = false;
+            return $false;
+         }
+         $arr =& $rs->GetAssoc($force_array,$first2cols);
+         return $arr;
+      }
+      
+      function GetOne($sql,$inary=false) {
+      global $OSS_COUNTRECS;
+         $crecs = $OSS_COUNTRECS;
+         $OSS_COUNTRECS = false;
+         
+         $ret = false;
+         $rs = &$this->Execute($sql,$inary);
+         if ($rs) {      
+            if (!$rs->EOF) $ret = reset($rs->fields);
+            $rs->Close();
+         }
+         $OSS_COUNTRECS = $crecs;
+         return $ret;
+      }
+      
+      function CacheGetOne($secs2cache,$sql=false,$inary=false) {
+         $ret = false;
+         $rs = &$this->CacheExecute($secs2cache,$sql,$inary);
+         if ($rs) {      
+            if (!$rs->EOF) $ret = reset($rs->fields);
+            $rs->Close();
+         } 
+         
+         return $ret;
+      }
+      
+      function GetCol($sql, $inary = false, $trim = false) {
+           $rv = false;
+           $rs = &$this->Execute($sql, $inary);
+           if ($rs) {
+            $rv = array();
+               if ($trim) {
+               while (!$rs->EOF) {
+                  $rv[] = trim(reset($rs->fields));
+                  $rs->MoveNext();
+                  }
+            } else {
+               while (!$rs->EOF) {
+                  $rv[] = reset($rs->fields);
+                  $rs->MoveNext();
+                  }
+            }
+               $rs->Close();
+           }
+           return $rv;
+      }
+      
+      function CacheGetCol($secs, $sql = false, $inary = false,$trim=false) {
+           $rv = false;
+           $rs = &$this->CacheExecute($secs, $sql, $inary);
+           if ($rs) {
+            if ($trim) {
+               while (!$rs->EOF) {
+                  $rv[] = trim(reset($rs->fields));
+                  $rs->MoveNext();
+                  }
+            } else {
+               while (!$rs->EOF) {
+                  $rv[] = reset($rs->fields);
+                  $rs->MoveNext();
+                  }
+            }
+               $rs->Close();
+           }
+           return $rv;
+      }
+    
+      function OffsetDate($dayFraction,$date=false) {      
+         if (!$date) $date = $this->sysDate;
+         return  '('.$date.'+'.$dayFraction.')';
+      }
+      
+      
+      function &GetArray($sql,$inary=false) {
+      global $OSS_COUNTRECS;
+         
+         $savec = $OSS_COUNTRECS;
+         $OSS_COUNTRECS = false;
+         $rs =& $this->Execute($sql,$inary);
+         $OSS_COUNTRECS = $savec;
+         if (!$rs) 
+            if (defined('OSS_PEAR')) return OSS_PEAR_Error();
+            else {
+               $false = false;
+               return $false;
+            }
+         $arr =& $rs->GetArray();
+         $rs->Close();
+         return $arr;
+      }
+      
+      function &CacheGetAll($secs2cache,$sql=false,$inary=false) {
+         return $this->CacheGetArray($secs2cache,$sql,$inary);
+      }
+      
+      function &CacheGetArray($secs2cache,$sql=false,$inary=false) {
+      global $OSS_COUNTRECS;
+         
+         $savec = $OSS_COUNTRECS;
+         $OSS_COUNTRECS = false;
+         $rs =& $this->CacheExecute($secs2cache,$sql,$inary);
+         $OSS_COUNTRECS = $savec;
+         
+         if (!$rs) 
+            if (defined('OSS_PEAR')) return OSS_PEAR_Error();
+            else {
+               $false = false;
+               return $false;
+            }
+         $arr =& $rs->GetArray();
+         $rs->Close();
+         return $arr;
+      }
+      
+      function &GetRow($sql,$inary=false) {
+      global $OSS_COUNTRECS;
+         $crecs = $OSS_COUNTRECS;
+         $OSS_COUNTRECS = false;
+         
+         $rs =& $this->Execute($sql,$inary);
+         
+         $OSS_COUNTRECS = $crecs;
+         if ($rs) {
+            if (!$rs->EOF) $arr = $rs->fields;
+            else $arr = array();
+            $rs->Close();
+            return $arr;
+         }
+         
+         $false = false;
+         return $false;
+      }
+      
+      function &CacheGetRow($secs2cache,$sql=false,$inary=false) {
+         $rs =& $this->CacheExecute($secs2cache,$sql,$inary);
+         if ($rs) {
+            $arr = false;
+            if (!$rs->EOF) $arr = $rs->fields;
+            $rs->Close();
+            return $arr;
+         }
+         $false = false;
+         return $false;
+      }
+      
+      function Replace($table, $fieldArray, $keyCol, $autoQuote=false, $has_autoinc=false) {
+         global $OSS_INCLUDED_LIB;
+         if (empty($OSS_INCLUDED_LIB)) include_once(OSS_DIR.'/oss_lib.inc.php');
+         
+         return _oss_replace($this, $table, $fieldArray, $keyCol, $autoQuote, $has_autoinc);
+      }
+      
+      function &CacheSelectLimit($secs2cache,$sql,$nrows=-1,$offset=-1,$inary=false) {   
+         if (!is_numeric($secs2cache)) {
+            if ($sql === false) $sql = -1;
+            if ($offset == -1) $offset = false;
+                                // sql,   nrows, offset,inputarr
+            $rs =& $this->SelectLimit($secs2cache,$sql,$nrows,$offset,$this->cacheSecs);
+         } else {
+            if ($sql === false) OssConnection::outp( "Warning: \$sql missing from CacheSelectLimit()");
+            $rs =& $this->SelectLimit($sql,$nrows,$offset,$inary,$secs2cache);
+         }
+         return $rs;
+      }
+      
+      function CacheFlush($sql=false,$inary=false) {
+      global $OSS_CACHE_DIR;
+      
+         if (strlen($OSS_CACHE_DIR) > 1 && !$sql) {
+            if (strncmp(PHP_OS,'WIN',3) === 0) {
+               $cmd = 'del /s '.str_replace('/','\\',$OSS_CACHE_DIR).'\oss_*.cache';
+            } else {
+               $cmd = 'rm -rf '.$OSS_CACHE_DIR.'/??/oss_*.cache'; 
+               // old version 'rm -f `find '.$OSS_CACHE_DIR.' -name oss_*.cache`';
+            }
+            if ($this->debug) {
+               OssConnection::outp( "CacheFlush: $cmd<br><pre>\n", system($cmd),"</pre>");
+            } else {
+               exec($cmd);
+            }
+            return;
+         } 
+         
+         global $OSS_INCLUDED_CSV;
+         if (empty($OSS_INCLUDED_CSV)) include_once(OSS_DIR.'/oss_csvlib.inc.php');
+         
+         $f = $this->_gencachename($sql.serialize($inary),false);
+         oss_write_file($f,''); // is oss_write_file needed?
+         if (!@unlink($f)) {
+            if ($this->debug) OssConnection::outp( "CacheFlush: failed for $f");
+         }
+      }
+      
+      function _gencachename($sql,$createdir) {
+      global $OSS_CACHE_DIR;
+      static $notSafeMode;
+         
+         if ($this->fetchMode === false) { 
+         global $OSS_FETCH_MODE;
+            $mode = $OSS_FETCH_MODE;
+         } else {
+            $mode = $this->fetchMode;
+         }
+         $m = md5($sql.$this->databaseType.$this->database.$this->user.$mode);
+         
+         if (!isset($notSafeMode)) $notSafeMode = !ini_get('safe_mode');
+         $dir = ($notSafeMode) ? $OSS_CACHE_DIR.'/'.substr($m,0,2) : $OSS_CACHE_DIR;
+            
+         if ($createdir && $notSafeMode && !file_exists($dir)) {
+            $oldu = umask(0);
+            if (!mkdir($dir,0771)) 
+               if ($this->debug) OssConnection::outp( "Unable to mkdir $dir for $sql");
+            umask($oldu);
+         }
+         return $dir.'/oss_'.$m.'.cache';
+      }
+      
+      function &CacheExecute($secs2cache,$sql=false,$inary=false) {
+         if (!is_numeric($secs2cache)) {
+            $inary = $sql;
+            $sql = $secs2cache;
+            $secs2cache = $this->cacheSecs;
+         }
+         global $OSS_INCLUDED_CSV;
+         if (empty($OSS_INCLUDED_CSV)) include_once(OSS_DIR.'/oss_csvlib.inc.php');
+         
+         if (is_array($sql)) $sql = $sql[0];
+            
+         $md5file = $this->_gencachename($sql.serialize($inary),true);
+         $err = '';
+         
+         if ($secs2cache > 0){
+            $rs = &csv2rs($md5file,$err,$secs2cache);
+            $this->numCacheHits += 1;
+         } else {
+            $err='Timeout 1';
+            $rs = false;
+            $this->numCacheMisses += 1;
+         }
+         if (!$rs) {
+         // no cached rs found
+            if ($this->debug) {
+               if (get_magic_quotes_runtime()) {
+                  OssConnection::outp("Please disable magic_quotes_runtime - it corrupts cache files :(");
+               }
+               if ($this->debug !== -1) OssConnection::outp( " $md5file cache failure: $err (see sql below)");
+            }
+            
+            $rs = &$this->Execute($sql,$inary);
+   
+            if ($rs) {
+               $eof = $rs->EOF;
+               $rs = &$this->_rs2rs($rs); // read entire recordset into memory immediately
+               $txt = _rs2serialize($rs,false,$sql); // serialize
+         
+               if (!oss_write_file($md5file,$txt,$this->debug)) {
+                  if ($fn = $this->raiseErrorFn) {
+                     $fn($this->databaseType,'CacheExecute',-32000,"Cache write error",$md5file,$sql,$this);
+                  }
+                  if ($this->debug) OssConnection::outp( " Cache write error");
+               }
+               if ($rs->EOF && !$eof) {
+                  $rs->MoveFirst();
+                  //$rs = &csv2rs($md5file,$err);      
+                  $rs->connection = &$this; // Pablo suggestion
+               }  
+               
+            } else
+               @unlink($md5file);
+         } else {
+            $this->_errorMsg = '';
+            $this->_errorCode = 0;
+            
+            if ($this->fnCacheExecute) {
+               $fn = $this->fnCacheExecute;
+               $fn($this, $secs2cache, $sql, $inary);
+            }
+         // ok, set cached object found
+            $rs->connection = &$this; // Pablo suggestion
+            if ($this->debug){ 
+            global $HTTP_SERVER_VARS;
+                  
+               $inBrowser = isset($HTTP_SERVER_VARS['HTTP_USER_AGENT']);
+               $ttl = $rs->timeCreated + $secs2cache - time();
+               $s = is_array($sql) ? $sql[0] : $sql;
+               if ($inBrowser) $s = '<i>'.htmlspecialchars($s).'</i>';
+               
+               OssConnection::outp( " $md5file reloaded, ttl=$ttl [ $s ]");
+            }
+         }
+         return $rs;
+      }
+      
+      function GetUpdateSQL(&$rs, $arrFields,$forceUpdate=false,$magicq=false,$force=null) {
+         global $OSS_INCLUDED_LIB;
+         if (!isset($force)) {
+               global $OSS_FORCE_TYPE;
+                $force = $OSS_FORCE_TYPE;
+         }
+         if (empty($OSS_INCLUDED_LIB)) include_once(OSS_DIR.'/oss_lib.inc.php');
+         return _oss_getupdatesql($this,$rs,$arrFields,$forceUpdate,$magicq,$force);
+      }
+   
+      function GetInsertSQL(&$rs, $arrFields,$magicq=false,$force=null) {   
+         global $OSS_INCLUDED_LIB;
+         if (!isset($force)) {
+            global $OSS_FORCE_TYPE;
+            $force = $OSS_FORCE_TYPE;
+            
+         }
+         if (empty($OSS_INCLUDED_LIB)) include_once(OSS_DIR.'/oss_lib.inc.php');
+         return _oss_getinsertsql($this,$rs,$arrFields,$magicq,$force);
+      }
+      
+      function UpdateBlob($table,$column,$val,$where,$blobtype='BLOB') {
+         return $this->Execute("UPDATE $table SET $column=? WHERE $where",array($val)) != false;
+      }
+   
+      function UpdateBlobFile($table,$column,$path,$where,$blobtype='BLOB') {
+         $fd = fopen($path,'rb');
+         if ($fd === false) return false;
+         $val = fread($fd,filesize($path));
+         fclose($fd);
+         return $this->UpdateBlob($table,$column,$val,$where,$blobtype);
+      }
+      
+      function BlobDecode($blob) {
+         return $blob;
+      }
+      
+      function BlobEncode($blob) {
+         return $blob;
+      }
+      
+      function SetCharSet($charset) {
+         return false;
+      }
+      
+      function IfNull( $field, $ifNull ) {
+         return " CASE WHEN $field is null THEN $ifNull ELSE $field END ";
+      }
+      
+      function GetCharSet() {
+         return false;
+      }
+      
+      function UpdateClob($table,$column,$val,$where) {
+         return $this->UpdateBlob($table,$column,$val,$where,'CLOB');
+      }
+      
+      function SetDateLocale($locale = 'En') {
+         $this->locale = $locale;
+         switch ($locale)
+         {
+            default:
+            case 'En':
+               $this->fmtDate="'Y-m-d'";
+               $this->fmtTimeStamp = "'Y-m-d H:i:s'";
+               break;
+      
+            case 'Fr':
+            case 'Ro':
+            case 'It':
+               $this->fmtDate="'d-m-Y'";
+               $this->fmtTimeStamp = "'d-m-Y H:i:s'";
+               break;
+               
+            case 'Ge':
+               $this->fmtDate="'d.m.Y'";
+               $this->fmtTimeStamp = "'d.m.Y H:i:s'";
+               break;
+         }
+      }
+   
+      function Close() {
+         $rez = $this->_close();
+         $this->_connectionID = false;
+         return $rez;
+      }
+      
+      function BeginTrans() {return false;}
+      function CommitTrans($ok=true) { return true;}
+      function RollbackTrans() { return false;}
+   
+         function MetaDatabases() {
+         global $OSS_FETCH_MODE;
+         
+            if ($this->metaDatabasesSQL) {
+               $save = $OSS_FETCH_MODE; 
+               $OSS_FETCH_MODE = OSS_FETCH_NUM; 
+               
+               if ($this->fetchMode !== false) $savem = $this->SetFetchMode(false);
+               
+               $arr = $this->GetCol($this->metaDatabasesSQL);
+               if (isset($savem)) $this->SetFetchMode($savem);
+               $OSS_FETCH_MODE = $save; 
+            
+               return $arr;
+            }
+            
+            return false;
+         }
+      function &MetaTables($ttype=false,$showSchema=false,$mask=false) {
+      global $OSS_FETCH_MODE;
+      
+         
+         $false = false;
+         if ($mask) {
+            return $false;
+         }
+         if ($this->metaTablesSQL) {
+            // complicated state saving by the need for backward compat
+            $save = $OSS_FETCH_MODE; 
+            $OSS_FETCH_MODE = OSS_FETCH_NUM; 
+            
+            if ($this->fetchMode !== false) $savem = $this->SetFetchMode(false);
+            
+            $rs = $this->Execute($this->metaTablesSQL);
+            if (isset($savem)) $this->SetFetchMode($savem);
+            $OSS_FETCH_MODE = $save; 
+            
+            if ($rs === false) return $false;
+            $arr =& $rs->GetArray();
+            $arr2 = array();
+            
+            if ($hast = ($ttype && isset($arr[0][1]))) { 
+               $showt = strncmp($ttype,'T',1);
+            }
+            
+            for ($i=0; $i < sizeof($arr); $i++) {
+               if ($hast) {
+                  if ($showt == 0) {
+                     if (strncmp($arr[$i][1],'T',1) == 0) $arr2[] = trim($arr[$i][0]);
+                  } else {
+                     if (strncmp($arr[$i][1],'V',1) == 0) $arr2[] = trim($arr[$i][0]);
+                  }
+               } else
+                  $arr2[] = trim($arr[$i][0]);
+            }
+            $rs->Close();
+            return $arr2;
+         }
+         return $false;
+      }
+      
+      
+      function _findschema(&$table,&$schema) {
+         if (!$schema && ($at = strpos($table,'.')) !== false) {
+            $schema = substr($table,0,$at);
+            $table = substr($table,$at+1);
+         }
+      }
+      
+      function &MetaColumns($table,$upper=true) {
+      global $OSS_FETCH_MODE;
+         
+         $false = false;
+         
+         if (!empty($this->metaColumnsSQL)) {
+         
+            $schema = false;
+            $this->_findschema($table,$schema);
+         
+            $save = $OSS_FETCH_MODE;
+            $OSS_FETCH_MODE = OSS_FETCH_NUM;
+            if ($this->fetchMode !== false) $savem = $this->SetFetchMode(false);
+            $rs = $this->Execute(sprintf($this->metaColumnsSQL,($upper)?strtoupper($table):$table));
+            if (isset($savem)) $this->SetFetchMode($savem);
+            $OSS_FETCH_MODE = $save;
+            if ($rs === false || $rs->EOF) return $false;
+   
+            $retarr = array();
+            while (!$rs->EOF) { //print_r($rs->fields);
+               $fld = new OssFieldObject();
+               $fld->name = $rs->fields[0];
+               $fld->type = $rs->fields[1];
+               if (isset($rs->fields[3]) && $rs->fields[3]) {
+                  if ($rs->fields[3]>0) $fld->max_length = $rs->fields[3];
+                  $fld->scale = $rs->fields[4];
+                  if ($fld->scale>0) $fld->max_length += 1;
+               } else
+                  $fld->max_length = $rs->fields[2];
+                  
+               if ($OSS_FETCH_MODE == OSS_FETCH_NUM) $retarr[] = $fld;   
+               else $retarr[strtoupper($fld->name)] = $fld;
+               $rs->MoveNext();
+            }
+            $rs->Close();
+            return $retarr;   
+         }
+         return $false;
+      }
+      
+        function MetaIndexes($table, $primary = false, $owner = false) {
+             $false = false;
+               return false;
+        }
+   
+      function &MetaColumnNames($table, $numIndexes=false) {
+         $objarr =& $this->MetaColumns($table);
+         if (!is_array($objarr)) {
+            $false = false;
+            return $false;
+         }
+         $arr = array();
+         if ($numIndexes) {
+            $i = 0;
+            foreach($objarr as $v) $arr[$i++] = $v->name;
+         } else
+            foreach($objarr as $v) $arr[strtoupper($v->name)] = $v->name;
+         
+         return $arr;
+      }
+            
+      function Concat() {   
+         $arr = func_get_args();
+         return implode($this->concat_operator, $arr);
+      }
+      
+      
+      function DBDate($d) {
+         if (empty($d) && $d !== 0) return 'null';
+   
+         if (is_string($d) && !is_numeric($d)) {
+            if ($d === 'null' || strncmp($d,"'",1) === 0) return $d;
+            if ($this->isoDates) return "'$d'";
+            $d = OssConnection::UnixDate($d);
+         }
+   
+         return oss_date($this->fmtDate,$d);
+      }
+      
+      function DBTimeStamp($ts) {
+         if (empty($ts) && $ts !== 0) return 'null';
+   
+         # strlen(14) allows YYYYMMDDHHMMSS format
+         if (!is_string($ts) || (is_numeric($ts) && strlen($ts)<14)) 
+            return oss_date($this->fmtTimeStamp,$ts);
+         
+         if ($ts === 'null') return $ts;
+         if ($this->isoDates && strlen($ts) !== 14) return "'$ts'";
+         
+         $ts = OssConnection::UnixTimeStamp($ts);
+         return oss_date($this->fmtTimeStamp,$ts);
+      }
+      
+      function UnixDate($v) {
+         if (is_object($v)) {
+            return oss_mktime($v->hour,$v->minute,$v->second,$v->month,$v->day, $v->year);
+         }
+      
+         if (is_numeric($v) && strlen($v) !== 8) return $v;
+         if (!preg_match( "|^([0-9]{4})[-/\.]?([0-9]{1,2})[-/\.]?([0-9]{1,2})|", 
+            ($v), $rr)) return false;
+   
+         if ($rr[1] <= TIMESTAMP_FIRST_YEAR) return 0;
+         // h-m-s-MM-DD-YY
+         return @oss_mktime(0,0,0,$rr[2],$rr[3],$rr[1]);
+      }
+      
+      function UnixTimeStamp($v) {
+         if (is_object($v)) {
+            return oss_mktime($v->hour,$v->minute,$v->second,$v->month,$v->day, $v->year);
+         }
+         
+         if (!preg_match( 
+            "|^([0-9]{4})[-/\.]?([0-9]{1,2})[-/\.]?([0-9]{1,2})[ ,-]*(([0-9]{1,2}):?([0-9]{1,2}):?([0-9\.]{1,4}))?|", 
+            ($v), $rr)) return false;
+            
+         if ($rr[1] <= TIMESTAMP_FIRST_YEAR && $rr[2]<= 1) return 0;
+      
+         // h-m-s-MM-DD-YY
+         if (!isset($rr[5])) return  oss_mktime(0,0,0,$rr[2],$rr[3],$rr[1]);
+         return  @oss_mktime($rr[5],$rr[6],$rr[7],$rr[2],$rr[3],$rr[1]);
+      }
+      
+      function UserDate($v,$fmt='Y-m-d',$gmt=false) {
+         $tt = $this->UnixDate($v);
+   
+         if (($tt === false || $tt == -1) && $v != false) return $v;
+         else if ($tt == 0) return $this->emptyDate;
+         else if ($tt == -1) { // pre-TIMESTAMP_FIRST_YEAR
+         }
+         
+         return ($gmt) ? oss_gmdate($fmt,$tt) : oss_date($fmt,$tt);
+      
+      }
+      function UserTimeStamp($v,$fmt='Y-m-d H:i:s',$gmt=false) {
+         if (is_numeric($v) && strlen($v)<14) return ($gmt) ? oss_gmdate($fmt,$v) : oss_date($fmt,$v);
+         $tt = $this->UnixTimeStamp($v);
+         // $tt == -1 if pre TIMESTAMP_FIRST_YEAR
+         if (($tt === false || $tt == -1) && $v != false) return $v;
+         if ($tt == 0) return $this->emptyTimeStamp;
+         return ($gmt) ? oss_gmdate($fmt,$tt) : oss_date($fmt,$tt);
+      }
+      
+      function addq($s,$magic_quotes=false) {
+         if (!$magic_quotes) {
+         
+            if ($this->replaceQuote[0] == '\\'){
+               // only since php 4.0.5
+               $s = oss_str_replace(array('\\',"\0"),array('\\\\',"\\\0"),$s);
+               //$s = str_replace("\0","\\\0", str_replace('\\','\\\\',$s));
+            }
+            return  str_replace("'",$this->replaceQuote,$s);
+         }
+         
+         // undo magic quotes for "
+         $s = str_replace('\\"','"',$s);
+         
+         if ($this->replaceQuote == "\\'")  // ' already quoted, no need to change anything
+            return $s;
+         else {// change \' to '' 
+            $s = str_replace('\\\\','\\',$s);
+            return str_replace("\\'",$this->replaceQuote,$s);
+         }
+      }
+      
+      function qstr($s,$magic_quotes=false) {   
+         if (!$magic_quotes) {
+         
+            if ($this->replaceQuote[0] == '\\'){
+               // only since php 4.0.5
+               $s = oss_str_replace(array('\\',"\0"),array('\\\\',"\\\0"),$s);
+               //$s = str_replace("\0","\\\0", str_replace('\\','\\\\',$s));
+            }
+            return  "'".str_replace("'",$this->replaceQuote,$s)."'";
+         }
+         
+         // undo magic quotes for "
+         $s = str_replace('\\"','"',$s);
+         
+         if ($this->replaceQuote == "\\'")  // ' already quoted, no need to change anything
+            return "'$s'";
+         else {// change \' to '' 
+            $s = str_replace('\\\\','\\',$s);
+            return "'".str_replace("\\'",$this->replaceQuote,$s)."'";
+         }
+      }
+      
+      
+      function &PageExecute($sql, $nrows, $page, $inary=false, $secs2cache=0) {
+         global $OSS_INCLUDED_LIB;
+         if (empty($OSS_INCLUDED_LIB)) include_once(OSS_DIR.'/oss_lib.inc.php');
+         if ($this->pageExecuteCountRows) $rs =& _oss_pageexecute_all_rows($this, $sql, $nrows, $page, $inary, $secs2cache);
+         else $rs =& _oss_pageexecute_no_last_page($this, $sql, $nrows, $page, $inary, $secs2cache);
+         return $rs;
+      }
+      
+      function &CachePageExecute($secs2cache, $sql, $nrows, $page,$inary=false) {
+         $rs =& $this->PageExecute($sql,$nrows,$page,$inary,$secs2cache);
+         return $rs;
+      }
+   } 
+   class OssFetchObj { };
+   
+   class OssRecordSet_empty {
+      var $dataProvider = 'empty';
+      var $databaseType = false;
+      var $EOF = true;
+      var $_numOfRows = 0;
+      var $fields = false;
+      var $connection = false;
+      function RowCount() {return 0;}
+      function RecordCount() {return 0;}
+      function PO_RecordCount(){return 0;}
+      function Close(){return true;}
+      function FetchRow() {return false;}
+      function FieldCount(){ return 0;}
+      function Init() {}
+   }
+   
+   include_once(OSS_DIR.'/oss_time.inc.php');
+
+   if (PHP_VERSION < 5) include_once(OSS_DIR.'/oss_php4.inc.php');
+   else include_once(OSS_DIR.'/oss_iterator.inc.php');
+
+   class OssRecordSet extends OSS_BASE_RS {
+      var $dataProvider = "native";
+      var $fields = false;    /// holds the current row data
+      var $f = false;    /// holds the current row data
+      var $blobSize = 100;    /// any varchar/char field this size or greater is treated as a blob
+      var $canSeek = false;    /// indicates that seek is supported
+      var $sql;             /// sql text
+      var $EOF = false;      /// Indicates that the last record in a Recordset object. 
+      var $emptyTimeStamp = '&nbsp;'; /// what to display when $time==0
+      var $emptyDate = '&nbsp;'; /// what to display when $time==0
+      var $debug = false;
+      var $timeCreated=0;    /// datetime in Unix format rs created -- for cached recordsets
+      var $bind = false;       /// used by Fields() to hold array - should be private?
+      var $fetchMode;         /// default fetch mode
+      var $connection = false; /// the parent connection
+   
+       //   private variables   
+      var $_numOfRows = -1;   /** number of rows, or -1 */
+      var $_numOfFields = -1;   /** number of fields in recordset */
+      var $_queryID = -1;      /** This variable keeps the result link identifier.   */
+      var $_currentRow = -1;   /** This variable keeps the current row in the Recordset.   */
+      var $_closed = false;    /** has recordset been closed */
+      var $_inited = false;    /** Init() should only be called once */
+      var $_obj;             /** Used by FetchObj */
+      var $_names;         /** Used by FetchObj */
+      
+      var $_currentPage = -1;   /** Added by Iván Oliva to implement recordset pagination */
+      var $_atFirstPage = false;   /** Added by Iván Oliva to implement recordset pagination */
+      var $_atLastPage = false;   /** Added by Iván Oliva to implement recordset pagination */
+      var $_lastPageNo = -1; 
+      var $_maxRecordCount = 0;
+      var $datetime = false;
+      
+      public function __construct($queryID) {
+         $this->OssRecordSet($queryID) ;
+      }
+      function OssRecordSet($queryID) {
+         $this->_queryID = $queryID;
+	 $this->f = &$this->fields;
+      }
+      
+      function Init() {
+         if ($this->_inited) return;
+         $this->_inited = true;
+         if ($this->_queryID) @$this->_initrs();
+         else {
+//echo '<p>In OssConnection recordset in int no _queryID  ' . $OSS_COUNTRECS  . '</p>' ;
+            $this->_numOfRows = 0;
+            $this->_numOfFields = 0;
+         }
+         if ($this->_numOfRows != 0 && $this->_numOfFields && $this->_currentRow == -1) {
+            
+            $this->_currentRow = 0;
+            if ($this->EOF = ($this->_fetch() === false)) {
+               $this->_numOfRows = 0; // _numOfRows could be -1
+            }
+         } else {
+            $this->EOF = true;
+         }
+      }
+      
+      function GetMenu($name,$defstr='',$blank1stItem=true,$multiple=false, $size=0, $selectAttr='',$compareFields0=true) {
+         global $OSS_INCLUDED_LIB;
+         if (empty($OSS_INCLUDED_LIB)) include_once(OSS_DIR.'/oss_lib.inc.php');
+         return _oss_getmenu($this, $name,$defstr,$blank1stItem,$multiple,
+            $size, $selectAttr,$compareFields0);
+      }
+      
+      function GetMenu2($name,$defstr='',$blank1stItem=true,$multiple=false,$size=0, $selectAttr=''){
+         global $OSS_INCLUDED_LIB;
+         if (empty($OSS_INCLUDED_LIB)) include_once(OSS_DIR.'/oss_lib.inc.php');
+         return _oss_getmenu($this,$name,$defstr,$blank1stItem,$multiple,$size, $selectAttr,false);
+      }
+   
+      function &GetArray($nRows = -1) {
+         global $OSS_EXTENSION; if ($OSS_EXTENSION) return oss_getall($this,$nRows);
+         $results = array();
+         $cnt = 0;
+         while (!$this->EOF && $nRows != $cnt) {
+            $results[] = $this->fields;
+            $this->MoveNext();
+            $cnt++;
+         }
+         return $results;
+      }
+      
+      function GetAll($nRows = -1) {
+         $arr =& $this->GetArray($nRows);
+         return $arr;
+      }
+      
+      function NextRecordSet() {
+         return false;
+      }
+      
+      function &GetArrayLimit($nrows,$offset=-1) {   
+         if ($offset <= 0) {
+            $arr =& $this->GetArray($nrows);
+            return $arr;
+         } 
+         $this->Move($offset);
+         $results = array();
+         $cnt = 0;
+         while (!$this->EOF && $nrows != $cnt) {
+            $results[$cnt++] = $this->fields;
+            $this->MoveNext();
+         }
+         return $results;
+      }
+      
+      function &GetRows($nRows = -1) {
+         $arr =& $this->GetArray($nRows);
+         return $arr;
+      }
+      
+      function &GetAssoc($force_array = false, $first2cols = false) {
+         global $OSS_EXTENSION;
+         $cols = $this->_numOfFields;
+         if ($cols < 2) {
+            $false = false;
+            return $false;
+         }
+         $numIndex = isset($this->fields[0]);
+         $results = array();
+         
+         if (!$first2cols && ($cols > 2 || $force_array)) {
+            if ($OSS_EXTENSION) {
+               if ($numIndex) {
+                  while (!$this->EOF) {
+                     $results[trim($this->fields[0])] = array_slice($this->fields, 1);
+                     oss_movenext($this);
+                  }
+               } else {
+                  while (!$this->EOF) {
+                     $results[trim(reset($this->fields))] = array_slice($this->fields, 1);
+                     oss_movenext($this);
+                  }
+               }
+            } else {
+               if ($numIndex) {
+                  while (!$this->EOF) {
+                     $results[trim($this->fields[0])] = array_slice($this->fields, 1);
+                     $this->MoveNext();
+                  }
+               } else {
+                  while (!$this->EOF) {
+                     $results[trim(reset($this->fields))] = array_slice($this->fields, 1);
+                     $this->MoveNext();
+                  }
+               }
+            }
+         } else {
+            if ($OSS_EXTENSION) {
+               if ($numIndex) {
+                  while (!$this->EOF) {
+                     $results[trim(($this->fields[0]))] = $this->fields[1];
+                     oss_movenext($this);
+                  }
+               } else {
+                  while (!$this->EOF) {
+                     $v1 = trim(reset($this->fields));
+                     $v2 = ''.next($this->fields); 
+                     $results[$v1] = $v2;
+                     oss_movenext($this);
+                  }
+               }
+            } else {
+               if ($numIndex) {
+                  while (!$this->EOF) {
+                     $results[trim(($this->fields[0]))] = $this->fields[1];
+                     $this->MoveNext();
+                  }
+               } else {
+                  while (!$this->EOF) {
+                     $v1 = trim(reset($this->fields));
+                     $v2 = ''.next($this->fields); 
+                     $results[$v1] = $v2;
+                     $this->MoveNext();
+                  }
+               }
+            }
+         }
+         return $results; 
+      }
+      
+      function UserTimeStamp($v,$fmt='Y-m-d H:i:s') {
+         if (is_numeric($v) && strlen($v)<14) return oss_date($fmt,$v);
+         $tt = $this->UnixTimeStamp($v);
+         if (($tt === false || $tt == -1) && $v != false) return $v;
+         if ($tt === 0) return $this->emptyTimeStamp;
+         return oss_date($fmt,$tt);
+      }
+      
+      
+      function UserDate($v,$fmt='Y-m-d') {
+         // $tt == -1 if pre TIMESTAMP_FIRST_YEAR
+         if (($tt === false || $tt == -1) && $v != false) return $v;
+         else if ($tt == 0) return $this->emptyDate;
+         else if ($tt == -1) { // pre-TIMESTAMP_FIRST_YEAR
+         }
+         return oss_date($fmt,$tt);
+      }
+      
+      function UnixDate($v) {
+         return OssConnection::UnixDate($v);
+      }
+   
+      function UnixTimeStamp($v) {
+         return OssConnection::UnixTimeStamp($v);
+      }
+      
+      function Free() {
+         return $this->Close();
+      }
+      
+      function NumRows() {
+         return $this->_numOfRows;
+      }
+      
+      function NumCols() {
+         return $this->_numOfFields;
+      }
+      
+      function &FetchRow() {
+         if ($this->EOF) {
+            $false = false;
+            return $false;
+         }
+         $arr = $this->fields;
+         $this->_currentRow++;
+         if (!$this->_fetch()) $this->EOF = true;
+         return $arr;
+      }
+      
+      function FetchInto(&$arr) {
+         if ($this->EOF) return (defined('PEAR_ERROR_RETURN')) ? new PEAR_Error('EOF',-1): false;
+         $arr = $this->fields;
+         $this->MoveNext();
+         return 1; // DB_OK
+      }
+      
+      function MoveFirst() {
+         if ($this->_currentRow == 0) return true;
+         return $this->Move(0);         
+      }         
+   
+      function MoveLast() {
+         if ($this->_numOfRows >= 0) return $this->Move($this->_numOfRows-1);
+         if ($this->EOF) return false;
+         while (!$this->EOF) {
+            $f = $this->fields;
+            $this->MoveNext();
+         }
+         $this->fields = $f;
+         $this->EOF = false;
+         return true;
+      }
+      
+      function MoveNext() {
+         if (!$this->EOF) {
+            $this->_currentRow++;
+            if ($this->_fetch()) return true;
+         }
+         $this->EOF = true;
+         return false;
+      }
+      
+      function Move($rowNumber = 0) {
+         $this->EOF = false;
+         if ($rowNumber == $this->_currentRow) return true;
+         if ($rowNumber >= $this->_numOfRows)
+            if ($this->_numOfRows != -1) $rowNumber = $this->_numOfRows-2;
+                 
+         if ($this->canSeek) { 
+            if ($this->_seek($rowNumber)) {
+               $this->_currentRow = $rowNumber;
+               if ($this->_fetch()) {
+                  return true;
+               }
+            } else {
+               $this->EOF = true;
+               return false;
+            }
+         } else {
+            if ($rowNumber < $this->_currentRow) return false;
+            global $OSS_EXTENSION;
+            if ($OSS_EXTENSION) {
+               while (!$this->EOF && $this->_currentRow < $rowNumber) {
+                  oss_movenext($this);
+               }
+            } else {
+               while (! $this->EOF && $this->_currentRow < $rowNumber) {
+                  $this->_currentRow++;
+                  if (!$this->_fetch()) $this->EOF = true;
+               }
+            }
+            return !($this->EOF);
+         }
+         
+         $this->fields = false;   
+         $this->EOF = true;
+         return false;
+      }
+      
+      function Fields($colname) {
+         return $this->fields[$colname];
+      }
+      
+      function GetAssocKeys($upper=true) {
+         $this->bind = array();
+         for ($i=0; $i < $this->_numOfFields; $i++) {
+            $o =& $this->FetchField($i);
+            if ($upper === 2) $this->bind[$o->name] = $i;
+            else $this->bind[($upper) ? strtoupper($o->name) : strtolower($o->name)] = $i;
+         }
+      }
+      
+      function &GetRowAssoc($upper=1) {
+         $record = array();
+         if (!$this->bind) {
+            $this->GetAssocKeys($upper);
+         }
+         foreach($this->bind as $k => $v) {
+            $record[$k] = $this->fields[$v];
+         }
+         return $record;
+      }
+      
+      function Close() {
+         if (!$this->_closed) {
+            $this->_closed = true;
+            return $this->_close();      
+         } else return true;
+      }
+      
+      function RecordCount() {return $this->_numOfRows;} 
+      function MaxRecordCount() {
+         return ($this->_maxRecordCount) ? $this->_maxRecordCount : $this->RecordCount();
+      }
+      
+      function RowCount() {return $this->_numOfRows;} 
+      function PO_RecordCount($table="", $condition="") {
+         $lnumrows = $this->_numOfRows;
+         if ($lnumrows == -1 && $this->connection) {
+            IF ($table) {
+               if ($condition) $condition = " WHERE " . $condition; 
+               $resultrows = &$this->connection->Execute("SELECT COUNT(*) FROM $table $condition");
+               if ($resultrows) $lnumrows = reset($resultrows->fields);
+            }
+         }
+         return $lnumrows;
+      }
+      
+      function CurrentRow() {return $this->_currentRow;} 
+      function AbsolutePosition() {return $this->_currentRow;}
+      
+      function FieldCount() {return $this->_numOfFields;}   
+   
+      function &FetchField($fieldoffset) {
+         // must be defined by child class
+      }   
+      
+      function& FieldTypesArray() {
+         $arr = array();
+         for ($i=0, $max=$this->_numOfFields; $i < $max; $i++) 
+            $arr[] = $this->FetchField($i);
+         return $arr;
+      }
+      
+      function &FetchObj() {
+         $o =& $this->FetchObject(false);
+         return $o;
+      }
+      
+      function &FetchObject($isupper=true) {
+         if (empty($this->_obj)) {
+            $this->_obj = new OssFetchObj();
+            $this->_names = array();
+            for ($i=0; $i <$this->_numOfFields; $i++) {
+               $f = $this->FetchField($i);
+               $this->_names[] = $f->name;
+            }
+         }
+         $i = 0;
+         $o = &$this->_obj;
+         for ($i=0; $i <$this->_numOfFields; $i++) {
+            $name = $this->_names[$i];
+            if ($isupper) $n = strtoupper($name);
+            else $n = $name;
+            
+            $o->$n = $this->Fields($name);
+         }
+         return $o;
+      }
+      
+      function &FetchNextObj() {
+         $o = $this->FetchNextObject(false);
+         return $o;
+      }
+      
+      function &FetchNextObject($isupper=true) {
+         $o = false;
+         if ($this->_numOfRows != 0 && !$this->EOF) {
+            $o = $this->FetchObject($isupper);   
+            $this->_currentRow++;
+            if ($this->_fetch()) return $o;
+         }
+         $this->EOF = true;
+         return $o;
+      }
+      
+      function MetaType($t,$len=-1,$fieldobj=false) {
+         if (is_object($t)) {
+            $fieldobj = $t;
+            $t = $fieldobj->type;
+            $len = $fieldobj->max_length;
+         }
+      static $typeMap = array(
+         'VARCHAR' => 'C',
+         'VARCHAR2' => 'C',
+         'CHAR' => 'C',
+         'C' => 'C',
+         'STRING' => 'C',
+         'NCHAR' => 'C',
+         'NVARCHAR' => 'C',
+         'VARYING' => 'C',
+         'BPCHAR' => 'C',
+         'CHARACTER' => 'C',
+         'INTERVAL' => 'C',  # Postgres
+         ##
+         'LONGCHAR' => 'X',
+         'TEXT' => 'X',
+         'NTEXT' => 'X',
+         'M' => 'X',
+         'X' => 'X',
+         'CLOB' => 'X',
+         'NCLOB' => 'X',
+         'LVARCHAR' => 'X',
+         ##
+         'BLOB' => 'B',
+         'IMAGE' => 'B',
+         'BINARY' => 'B',
+         'VARBINARY' => 'B',
+         'LONGBINARY' => 'B',
+         'B' => 'B',
+         ##
+         'YEAR' => 'D', // mysql
+         'DATE' => 'D',
+         'D' => 'D',
+         ##
+         'TIME' => 'T',
+         'TIMESTAMP' => 'T',
+         'DATETIME' => 'T',
+         'TIMESTAMPTZ' => 'T',
+         'T' => 'T',
+         ##
+         'BOOL' => 'L',
+         'BOOLEAN' => 'L', 
+         'BIT' => 'L',
+         'L' => 'L',
+         ##
+         'COUNTER' => 'R',
+         'R' => 'R',
+         'SERIAL' => 'R', // ifx
+         'INT IDENTITY' => 'R',
+         ##
+         'INT' => 'I',
+         'INTEGER' => 'I',
+         'INTEGER UNSIGNED' => 'I',
+         'SHORT' => 'I',
+         'TINYINT' => 'I',
+         'SMALLINT' => 'I',
+         'I' => 'I',
+         ##
+         'LONG' => 'N', 
+         'BIGINT' => 'N', // this is bigger than PHP 32-bit integers
+         'DECIMAL' => 'N',
+         'DEC' => 'N',
+         'REAL' => 'N',
+         'DOUBLE' => 'N',
+         'DOUBLE PRECISION' => 'N',
+         'SMALLFLOAT' => 'N',
+         'FLOAT' => 'N',
+         'NUMBER' => 'N',
+         'NUM' => 'N',
+         'NUMERIC' => 'N',
+         'MONEY' => 'N',
+         );
+         
+         $tmap = false;
+         $t = strtoupper($t);
+         $tmap = @$typeMap[$t];
+         switch ($tmap) {
+         case 'C':
+            if ($this->blobSize >= 0) {
+               if ($len > $this->blobSize) return 'X';
+            } else if ($len > 250) {
+               return 'X';
+            }
+            return 'C';
+            
+         case 'I':
+            if (!empty($fieldobj->primary_key)) return 'R';
+            return 'I';
+         
+         case false:
+            return 'N';
+            
+         case 'B':
+             if (isset($fieldobj->binary)) 
+                return ($fieldobj->binary) ? 'B' : 'X';
+            return 'B';
+         
+         case 'D':
+            if (!empty($this->datetime)) return 'T';
+            return 'D';
+            
+         default: 
+            return $tmap;
+         }
+      }
+      
+      function _close() {} 
+      function AbsolutePage($page=-1) {
+         if ($page != -1) $this->_currentPage = $page;
+         return $this->_currentPage;
+      }
+      
+      function AtFirstPage($status=false) {
+         if ($status != false) $this->_atFirstPage = $status;
+         return $this->_atFirstPage;
+      }
+      
+      function LastPageNo($page = false) {
+         if ($page != false) $this->_lastPageNo = $page;
+         return $this->_lastPageNo;
+      }
+      
+      function AtLastPage($status=false) {
+         if ($status != false) $this->_atLastPage = $status;
+         return $this->_atLastPage;
+      }
+      
+   } // end class OssRecordSet
+   
+   class OssRecordSet_array extends OssRecordSet {
+      var $databaseType = 'array';
+      var $_array;    // holds the 2-dimensional data array
+      var $_types;   // the array of types of each column (C B I L M)
+      var $_colnames;   // names of each column in array
+      var $_skiprow1;   // skip 1st row because it holds column names
+      var $_fieldarr; // holds array of field objects
+      var $canSeek = true;
+      var $affectedrows = false;
+      var $insertid = false;
+      var $sql = '';
+      var $compat = false;
+
+      public function __construct($fakeid=1) {
+         $this->OssRecordSet_array($fakeid) ;
+      }
+      function OssRecordSet_array($fakeid=1) {
+         global $OSS_FETCH_MODE,$OSS_COMPAT_FETCH;
+      
+         $this->compat = !empty($OSS_COMPAT_FETCH);
+         $this->OssRecordSet($fakeid); // fake queryID      
+         $this->fetchMode = $OSS_FETCH_MODE;
+      }
+      
+      function InitArray($array,$typearr,$colnames=false) {
+         $this->_array = $array;
+         $this->_types = $typearr;   
+         if ($colnames) {
+            $this->_skiprow1 = false;
+            $this->_colnames = $colnames;
+         } else  {
+            $this->_skiprow1 = true;
+            $this->_colnames = $array[0];
+         }
+         $this->Init();
+      }
+      function InitArrayFields(&$array,&$fieldarr) {
+         $this->_array =& $array;
+         $this->_skiprow1= false;
+         if ($fieldarr) {
+            $this->_fieldobjects =& $fieldarr;
+         } 
+         $this->Init();
+      }
+      
+      function &GetArray($nRows=-1) {
+         if ($nRows == -1 && $this->_currentRow <= 0 && !$this->_skiprow1) {
+            return $this->_array;
+         } else {
+            $arr =& OssRecordSet::GetArray($nRows);
+            return $arr;
+         }
+      }
+      
+      function _initrs() {
+         $this->_numOfRows =  sizeof($this->_array);
+         if ($this->_skiprow1) $this->_numOfRows -= 1;
+         $this->_numOfFields =(isset($this->_fieldobjects)) ?
+             sizeof($this->_fieldobjects):sizeof($this->_types);
+      }
+      
+      function Fields($colname) {
+         $mode = isset($this->ossFetchMode) ? $this->ossFetchMode : $this->fetchMode;
+         if ($mode & OSS_FETCH_ASSOC) {
+            if (!isset($this->fields[$colname])) $colname = strtolower($colname);
+            return $this->fields[$colname];
+         }
+         if (!$this->bind) {
+            $this->bind = array();
+            for ($i=0; $i < $this->_numOfFields; $i++) {
+               $o = $this->FetchField($i);
+               $this->bind[strtoupper($o->name)] = $i;
+            }
+         }
+         return $this->fields[$this->bind[strtoupper($colname)]];
+      }
+      
+      function &FetchField($fieldOffset = -1) {
+         if (isset($this->_fieldobjects)) {
+            return $this->_fieldobjects[$fieldOffset];
+         }
+         $o =  new OssFieldObject();
+         $o->name = $this->_colnames[$fieldOffset];
+         $o->type =  $this->_types[$fieldOffset];
+         $o->max_length = -1; // length not known
+         return $o;
+      }
+         
+      function _seek($row) {
+         if (sizeof($this->_array) && 0 <= $row && $row < $this->_numOfRows) {
+            $this->_currentRow = $row;
+            if ($this->_skiprow1) $row += 1;
+            $this->fields = $this->_array[$row];
+            return true;
+         }
+         return false;
+      }
+      
+      function MoveNext() {
+         if (!$this->EOF) {      
+            $this->_currentRow++;
+            $pos = $this->_currentRow;
+            if ($this->_numOfRows <= $pos) {
+               if (!$this->compat) $this->fields = false;
+            } else {
+               if ($this->_skiprow1) $pos += 1;
+               $this->fields = $this->_array[$pos];
+               return true;
+            }      
+            $this->EOF = true;
+         }
+         
+         return false;
+      }   
+   
+      function _fetch() {
+         $pos = $this->_currentRow;
+         if ($this->_numOfRows <= $pos) {
+            if (!$this->compat) $this->fields = false;
+            return false;
+         }
+         if ($this->_skiprow1) $pos += 1;
+         $this->fields = $this->_array[$pos];
+         return true;
+      }
+      
+      function _close() {
+         return true;   
+      }
+   } // OssRecordSet_array
+
+   function OssLoadDB($dbType) { 
+      return OssLoadCode($dbType);
+   }
+      
+   function OssLoadCode($dbType) {
+      global $OSS_LASTDB;
+   
+      if (!$dbType) return false;
+      $db = strtolower($dbType);
+      switch ($db) {
+         case 'postgres':
+         case 'pgsql': $db = 'postgres7'; break;
+      }
+//echo '<P> in oss.inc.php loading driver ' . $db . '</p>' ;
+      @include_once(OSS_DIR."/oss_".$db.".inc.php");
+//echo '<P> in oss.inc.php loading driver over ' . $db . '</p>' ;
+      $OSS_LASTDB = $db;
+      $ok = class_exists("OSS_" . $db);
+      if ($ok) return $db;
+      print_r(get_declared_classes());
+      $file = OSS_DIR."/oss_".$db.".inc.php";
+      if (!file_exists($file)) OssConnection::outp("Missing file: $file");
+      else OssConnection::outp("Syntax error in file: $file");
+      return false;
+   }
+
+   function &NewOssConnection($db='') {
+      $tmp =& OssNewConnection($db);
+      return $tmp;
+   }
+   
+   function &OssNewConnection($db='') {
+      GLOBAL $OSS_NEWCONNECTION, $OSS_LASTDB;
+      if (!defined('OSS_ASSOC_CASE')) define('OSS_ASSOC_CASE',2);
+      $errorfn = (defined('OSS_ERROR_HANDLER')) ? OSS_ERROR_HANDLER : false;
+      $false = false;
+      if (strpos($db,'://')) {
+         $origdsn = $db;
+         $dsna = @parse_url($db);
+         if (!$dsna) {
+            $db = str_replace('@/','@oss_fakehost/',$db);
+            $dsna = parse_url($db);
+            if (!$dsna) return $false;
+            $dsna['host'] = '';
+         }
+         $db = @$dsna['scheme'];
+         if (!$db) return $false;
+         $dsna['host'] = isset($dsna['host']) ? rawurldecode($dsna['host']) : '';
+         $dsna['user'] = isset($dsna['user']) ? rawurldecode($dsna['user']) : '';
+         $dsna['pass'] = isset($dsna['pass']) ? rawurldecode($dsna['pass']) : '';
+         $dsna['path'] = isset($dsna['path']) ? rawurldecode(substr($dsna['path'],1)) : '';
+         
+         if (isset($dsna['query'])) {
+            $opt1 = explode('&',$dsna['query']);
+            foreach($opt1 as $k => $v) {
+               $arr = explode('=',$v);
+               $opt[$arr[0]] = isset($arr[1]) ? rawurldecode($arr[1]) : 1;
+            }
+         } else $opt = array();
+      }
+      
+//echo '<P> in oss.inc.php 1 ' . $db . '</p>' ;
+      if (!empty($OSS_NEWCONNECTION)) {
+         $obj = $OSS_NEWCONNECTION($db);
+//echo '<P> in oss.inc.php 1.1 ' . $db . '</p>' ;
+      } else {
+//echo '<P> in oss.inc.php 2.1 ' . $db . '</p>' ;
+         if (!isset($OSS_LASTDB)) $OSS_LASTDB = '';
+//echo '<P> in oss.inc.php 2.2 ' . $db . '</p>' ;
+         if (empty($db)) $db = $OSS_LASTDB;
+//echo '<P> in oss.inc.php 2.3 ' . $db . '</p>' ;
+         if ($db != $OSS_LASTDB) $db = OssLoadCode($db);
+//echo '<P> in oss.inc.php 2.4' . $db . '</p>' ;
+         
+         if (!$db) {
+            if (isset($origdsn)) $db = $origdsn;
+            if ($errorfn) {
+               $ignore = false;
+               $errorfn('OssNewConnection', 'OssNewConnection', -998,
+                      "could not load the database driver for '$db'",
+                      $db,false,$ignore);
+            } else
+                OssConnection::outp( "<p>OssNewConnection: Unable to load database driver '$db'</p>",false);
+            return $false;
+         }
+         $cls = 'OSS_'.$db;
+//echo '<P> in oss.inc.php 3 class ' . $cls . '</p>' ;
+         if (!class_exists($cls)) {
+            oss_backtrace();
+            return $false;
+         }
+//echo '<P> in oss.inc.php 3 class ' . $cls . ' exists </p>' ;
+         $obj = new $cls();
+      }
+      
+      if ($obj) {
+         if ($errorfn)  $obj->raiseErrorFn = $errorfn;
+         if (isset($dsna)) {
+            foreach($opt as $k => $v) {
+               switch(strtolower($k)) {
+               case 'persist':
+               case 'persistent':    $persist = $v; break;
+               case 'debug':      $obj->debug = (integer) $v; break;
+               case 'dialect':    $obj->dialect = (integer) $v; break;
+               case 'charset':      $obj->charset = $v; break;
+               case 'buffers':      $obj->buffers = $v; break;
+               case 'fetchmode':   $obj->SetFetchMode($v); break;
+               case 'charpage':   $obj->charPage = $v; break;
+               #mysql, mysqli
+               case 'clientflags': $obj->clientFlags = $v; break;
+               #mysqli
+               case 'port': $obj->port = $v; break;
+               case 'socket': $obj->socket = $v; break;
+               case 'nls_date_format': $obj->NLS_DATE_FORMAT = $v; break;
+               }
+            }
+            if (empty($persist))
+               $ok = $obj->Connect($dsna['host'], $dsna['user'], $dsna['pass'], $dsna['path']);
+            else
+               $ok = $obj->PConnect($dsna['host'], $dsna['user'], $dsna['pass'], $dsna['path']);
+               
+            if (!$ok) return $false;
+         }
+      }
+      return $obj;
+   }
+   
+   function oss_pr($var,$as_string=false) {
+      if ($as_string) ob_start();
+      
+      if (isset($_SERVER['HTTP_USER_AGENT'])) { 
+         echo " <pre>\n";print_r($var);echo "</pre>\n";
+      } else print_r($var);
+      if ($as_string) {
+         $s = ob_get_contents();
+         ob_end_clean();
+         return $s;
+      }
+   }
+   
+   function oss_backtrace($printOrArr=true,$levels=9999) {
+      global $OSS_INCLUDED_LIB;
+      if (empty($OSS_INCLUDED_LIB)) include_once(OSS_DIR.'/oss_lib.inc.php');
+      return _oss_backtrace($printOrArr,$levels);
+   }
+}
+?>
